@@ -137,6 +137,26 @@ class StatsResponse(BaseModel):
     commentaries: int
 
 
+class CastResponse(BaseModel):
+    cast_id: int
+    cast_name: str
+    movie_count: int
+
+
+class CommentarySearchResult(BaseModel):
+    commentary_id: int
+    movie_name: str
+    subject: str
+    commentary_type: str
+    language: str
+    commentary_text: str
+
+
+class PersonCount(BaseModel):
+    name: str
+    movie_count: int
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -295,6 +315,238 @@ def get_stats():
         row = cur.fetchone()
         cols = [d[0] for d in cur.description]
         return dict(zip(cols, row))
+
+
+# ---------------------------------------------------------------------------
+# Search endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/search/movies", response_model=List[MovieResponse])
+def search_movies(
+    q: str = Query(..., min_length=1, description="Search term"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Search movies by name, director, or cast member."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        pattern = f"%{q}%"
+        cur.execute("""
+            SELECT DISTINCT m.movie_id, m.movie_name, m.release_date, m.director,
+                   m.producer, m.music_director, m.lyricist,
+                   STRING_AGG(cm.cast_name, ', ' ORDER BY cm.cast_name) as cast
+            FROM movies m
+            LEFT JOIN movie_cast mc ON m.movie_id = mc.movie_id
+            LEFT JOIN cast_members cm ON mc.cast_id = cm.cast_id
+            WHERE m.movie_name ILIKE %s
+               OR m.director ILIKE %s
+               OR m.movie_id IN (
+                   SELECT mc2.movie_id FROM movie_cast mc2
+                   JOIN cast_members cm2 ON mc2.cast_id = cm2.cast_id
+                   WHERE cm2.cast_name ILIKE %s
+               )
+            GROUP BY m.movie_id
+            ORDER BY m.movie_name
+            OFFSET %s LIMIT %s
+        """, (pattern, pattern, pattern, skip, limit))
+        return rows_to_dicts(cur)
+
+
+@app.get("/search/commentaries", response_model=List[CommentarySearchResult])
+def search_commentaries(
+    q: str = Query(..., min_length=1, description="Search term"),
+    type: Optional[str] = Query(None, alias="type"),
+    language: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Full-text search across all commentaries."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        query = """
+            SELECT c.commentary_id, m.movie_name,
+                   COALESCE(s.song_name, 'Movie') as subject,
+                   c.commentary_type, c.language, c.commentary_text
+            FROM commentaries c
+            JOIN movies m ON c.movie_id = m.movie_id
+            LEFT JOIN songs s ON c.song_id = s.song_id
+            WHERE c.commentary_text ILIKE %s
+        """
+        params: list = [f"%{q}%"]
+
+        if type:
+            query += " AND c.commentary_type = %s"
+            params.append(type)
+        if language:
+            query += " AND c.language = %s"
+            params.append(language)
+
+        query += " ORDER BY m.movie_name OFFSET %s LIMIT %s"
+        params.extend([skip, limit])
+
+        cur.execute(query, params)
+        return rows_to_dicts(cur)
+
+
+# ---------------------------------------------------------------------------
+# Browse-by-attribute endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/movies/by-actor", response_model=List[MovieResponse])
+def get_movies_by_actor(
+    name: str = Query(..., description="Actor name (partial match)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Get movies featuring a specific actor."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT m.movie_id, m.movie_name, m.release_date, m.director,
+                   m.producer, m.music_director, m.lyricist,
+                   STRING_AGG(cm.cast_name, ', ' ORDER BY cm.cast_name) as cast
+            FROM movies m
+            JOIN movie_cast mc ON m.movie_id = mc.movie_id
+            JOIN cast_members cm ON mc.cast_id = cm.cast_id
+            WHERE m.movie_id IN (
+                SELECT mc2.movie_id FROM movie_cast mc2
+                JOIN cast_members cm2 ON mc2.cast_id = cm2.cast_id
+                WHERE cm2.cast_name ILIKE %s
+            )
+            GROUP BY m.movie_id
+            ORDER BY m.movie_name
+            OFFSET %s LIMIT %s
+        """, (f"%{name}%", skip, limit))
+        return rows_to_dicts(cur)
+
+
+@app.get("/movies/by-director", response_model=List[MovieResponse])
+def get_movies_by_director(
+    name: str = Query(..., description="Director name (partial match)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Get movies by a specific director."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT m.movie_id, m.movie_name, m.release_date, m.director,
+                   m.producer, m.music_director, m.lyricist,
+                   STRING_AGG(cm.cast_name, ', ' ORDER BY cm.cast_name) as cast
+            FROM movies m
+            LEFT JOIN movie_cast mc ON m.movie_id = mc.movie_id
+            LEFT JOIN cast_members cm ON mc.cast_id = cm.cast_id
+            WHERE m.director ILIKE %s
+            GROUP BY m.movie_id
+            ORDER BY m.movie_name
+            OFFSET %s LIMIT %s
+        """, (f"%{name}%", skip, limit))
+        return rows_to_dicts(cur)
+
+
+@app.get("/movies/by-year/{year}", response_model=List[MovieResponse])
+def get_movies_by_year(
+    year: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Get all movies from a specific year."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT m.movie_id, m.movie_name, m.release_date, m.director,
+                   m.producer, m.music_director, m.lyricist,
+                   STRING_AGG(cm.cast_name, ', ' ORDER BY cm.cast_name) as cast
+            FROM movies m
+            LEFT JOIN movie_cast mc ON m.movie_id = mc.movie_id
+            LEFT JOIN cast_members cm ON mc.cast_id = cm.cast_id
+            WHERE EXTRACT(YEAR FROM m.release_date) = %s
+            GROUP BY m.movie_id
+            ORDER BY m.movie_name
+            OFFSET %s LIMIT %s
+        """, (year, skip, limit))
+        return rows_to_dicts(cur)
+
+
+# ---------------------------------------------------------------------------
+# Cast & crew listing endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/cast", response_model=List[CastResponse])
+def get_cast(
+    q: Optional[str] = Query(None, description="Filter by name (partial match)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List all actors with their movie count."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        query = """
+            SELECT cm.cast_id, cm.cast_name, COUNT(mc.movie_id) as movie_count
+            FROM cast_members cm
+            LEFT JOIN movie_cast mc ON cm.cast_id = mc.cast_id
+        """
+        params: list = []
+
+        if q:
+            query += " WHERE cm.cast_name ILIKE %s"
+            params.append(f"%{q}%")
+
+        query += " GROUP BY cm.cast_id ORDER BY cm.cast_name OFFSET %s LIMIT %s"
+        params.extend([skip, limit])
+
+        cur.execute(query, params)
+        return rows_to_dicts(cur)
+
+
+@app.get("/directors", response_model=List[PersonCount])
+def get_directors():
+    """List all directors with their movie count."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT director as name, COUNT(*) as movie_count
+            FROM movies
+            WHERE director IS NOT NULL
+            GROUP BY director
+            ORDER BY movie_count DESC, director
+        """)
+        return rows_to_dicts(cur)
+
+
+# ---------------------------------------------------------------------------
+# Song-level commentary endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/songs/{song_id}/commentaries", response_model=List[CommentaryResponse])
+def get_song_commentaries(
+    song_id: int,
+    type: Optional[str] = Query(None, alias="type"),
+    language: Optional[str] = None,
+):
+    """Get commentaries for a specific song."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM songs WHERE song_id = %s", (song_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Song not found")
+
+        query = """
+            SELECT commentary_id, movie_id, song_id,
+                   commentary_type, language, commentary_text
+            FROM commentaries WHERE song_id = %s
+        """
+        params: list = [song_id]
+
+        if type:
+            query += " AND commentary_type = %s"
+            params.append(type)
+        if language:
+            query += " AND language = %s"
+            params.append(language)
+
+        cur.execute(query, params)
+        return rows_to_dicts(cur)
 
 
 # ---------------------------------------------------------------------------
